@@ -17,9 +17,21 @@ namespace StreamCompaction {
          * For performance analysis, this is supposed to be a simple for loop.
          * (Optional) For better understanding before starting moving to GPU, you can simulate your GPU scan in this function first.
          */
+        void computeScan(int n, int *odata, const int *idata)
+        {
+            odata[0] = 0;
+
+            for (int i = 1; i < n; i++)
+            {
+                odata[i] = odata[i - 1] + idata[i - 1];
+            }
+        }
+
         void scan(int n, int *odata, const int *idata) {
             timer().startCpuTimer();
-            // TODO
+
+            computeScan(n, odata, idata);
+
             timer().endCpuTimer();
         }
 
@@ -30,9 +42,21 @@ namespace StreamCompaction {
          */
         int compactWithoutScan(int n, int *odata, const int *idata) {
             timer().startCpuTimer();
-            // TODO
+
+            int odataIndex = 0;
+            for (int i = 0; i < n; i++)
+            {
+                int inputValue = idata[i];
+
+                if (inputValue != 0)
+                {
+                    odata[odataIndex] = inputValue;
+                    odataIndex++;
+                }
+            }
+
             timer().endCpuTimer();
-            return -1;
+            return odataIndex;
         }
 
         /**
@@ -42,9 +66,36 @@ namespace StreamCompaction {
          */
         int compactWithScan(int n, int *odata, const int *idata) {
             timer().startCpuTimer();
-            // TODO
+            
+            // t/f array is != 0 check
+            int *bitmap = new int[n];
+
+            for (int i = 0; i < n; i++)
+            {
+                bitmap[i] = (idata[i] != 0) ? 1 : 0;
+            }
+
+            // Scan this stuff
+            int *scanOut = new int[n];
+            computeScan(n, scanOut, bitmap);
+
+            // Scatter
+            int elements = 0;
+
+            for (int i = 0; i < n; i++)
+            {
+                if (bitmap[i] != 0)
+                {
+                    int finalOutIndex = scanOut[i];
+                    odata[finalOutIndex] = idata[i];
+                    elements++;
+                }
+            }
+
             timer().endCpuTimer();
-            return -1;
+            delete[] bitmap;
+            delete[] scanOut;
+            return elements;
         }
     }
 }

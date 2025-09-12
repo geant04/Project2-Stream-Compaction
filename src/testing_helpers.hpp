@@ -6,6 +6,8 @@
 #include <string>
 #include <ctime>
 
+#define USE_SIMPLE 0
+
 template<typename T>
 int cmpArrays(int n, T *a, T *b) {
     for (int i = 0; i < n; i++) {
@@ -53,7 +55,11 @@ void genArray(int n, int *a, int maxval) {
     srand(time(nullptr));
 
     for (int i = 0; i < n; i++) {
+#if USE_SIMPLE
+        a[i] = i;
+#else
         a[i] = rand() % maxval;
+#endif
     }
 }
 
