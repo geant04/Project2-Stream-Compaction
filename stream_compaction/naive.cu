@@ -43,6 +43,7 @@ namespace StreamCompaction {
             if (index == 0)
             {
                 dev_odata[index] = 0;
+                return;
             }
 
             dev_odata[index] = dev_idata[index - 1];
@@ -66,7 +67,7 @@ namespace StreamCompaction {
             cudaMemcpy(dev_idata, idata, dataSize, cudaMemcpyHostToDevice);
 
             // Kernel dispatches
-            int blockSize = 128;
+            int blockSize = n;
             int blocks = (paddedN + blockSize - 1) / blockSize;
 
             int stages = ilog2ceil(n);

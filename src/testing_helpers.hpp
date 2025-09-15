@@ -6,7 +6,7 @@
 #include <string>
 #include <ctime>
 
-#define USE_SIMPLE 0
+#define USE_SIMPLE 1
 
 template<typename T>
 int cmpArrays(int n, T *a, T *b) {

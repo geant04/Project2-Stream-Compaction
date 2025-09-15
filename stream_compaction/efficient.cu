@@ -5,6 +5,10 @@
 
 #include <iostream>
 
+// Debugging defines, toggling off/on chunks of code helps me figure stuff out
+#define SIMPLE_EFFICIENT_SCAN 1
+#define ENABLE_DOWNSWEEP 1
+
 namespace StreamCompaction {
     namespace Efficient {
         using StreamCompaction::Common::PerformanceTimer;
@@ -48,10 +52,6 @@ namespace StreamCompaction {
                 return;
             }
 
-            // let n = 8
-            // stage = 0, stride = 8, n/stride = 1
-            // stage = 1, stride = 4, n/stride = 2
-            // stage = 2, stride = 2, n/stride = 4
             int strideDiv2 = stride / 2;
 
             if (index < (n / stride))
@@ -66,20 +66,70 @@ namespace StreamCompaction {
             }
         }
 
-        __global__ void clearLastElem(int n, int* dev_odata)
+        // Shared mem implementation
+        __global__ void optimizedSharedScan(int n, int* dev_odata)
         {
-            int index = blockDim.x * blockIdx.x + threadIdx.x;
+            extern __shared__ float sharedData[];
+            
+            int threadID = threadIdx.x;
 
-            if (index >= n)
+            // This only works for thread up to max block size for now.
+            // I'll have to spend a few hours to figure out how to fit everything on a SM.
+            // There are also some potential bank conflicts.
+            sharedData[threadID] = dev_odata[threadID];
+
+            __syncthreads();
+
+            // Shared mem upsweep, nothing too different.
+            for (int d = n/2; d > 0; d >>= 1)
             {
-                return;
+                if (threadID < d)
+                {
+                    int strideMult2 = n/d;
+                    int stride = strideMult2 >> 1;
+
+                    int writeIndex = threadID * strideMult2;
+                    sharedData[writeIndex + strideMult2 - 1] += sharedData[writeIndex + stride - 1];
+                }
+
+                __syncthreads();
             }
 
-            if (index == n - 1)
+            // clear last element... this will waste a few cycles
+            if (threadID < 1)
             {
-                dev_odata[index] = 0;
+                sharedData[n - 1] = 0;
             }
+
+            __syncthreads();
+
+#if ENABLE_DOWNSWEEP
+            for (int d = 1; d < n; d <<= 1)
+            {
+                if (threadID < d)
+                {
+                    int stride = n/d;
+                    int strideDiv2 = stride >> 1;
+
+                    int writeIndex = threadID * stride;
+
+                    int left = sharedData[writeIndex + strideDiv2 - 1];
+                    int right = sharedData[writeIndex + stride - 1];
+
+                    sharedData[writeIndex + strideDiv2 - 1] = right;
+                    sharedData[writeIndex + stride - 1] += left;
+                }
+
+                __syncthreads();
+            }
+
+            __syncthreads();
+#endif
+
+
+            dev_odata[threadID] = sharedData[threadID];
         }
+
 
         /**
          * Performs prefix-sum (aka scan) on idata, storing the result into odata.
@@ -121,7 +171,7 @@ namespace StreamCompaction {
             int stride = 1;
 
             timer().startGpuTimer();
-
+            
             scanDispatch(blocks, blockSize, paddedN, stages, stride, dev_odata);
 
             timer().endGpuTimer();
@@ -130,6 +180,101 @@ namespace StreamCompaction {
             
             cudaFree(dev_odata);
         }
+
+        void optimizedScan(int n, int *odata, const int *idata)
+        {
+            int paddedN = 1 << ilog2ceil(n);
+
+            int *dev_odata;
+            int sizeOfData = paddedN * sizeof(int);
+
+            cudaMalloc((void**)&dev_odata, sizeOfData);
+
+            // Copy idata to dev_odata first, this way we can easily modify in place
+            cudaMemcpy(dev_odata, idata, n * sizeof(int), cudaMemcpyHostToDevice);
+
+            int blockSize = 512;
+            int blocks = (paddedN + blockSize - 1) / blockSize;
+
+            int stages = ilog2(paddedN);
+            int stride = 1;
+
+            int optimizedBlockSize = blockSize;
+            int optimizedBlocks = blocks;
+
+            int threadsToRun, optimizedN;
+
+            timer().startGpuTimer();
+
+            for (int d = 0; d < stages; d++)
+            {
+                upsweep<<<optimizedBlocks, optimizedBlockSize>>>(paddedN, stride, dev_odata);
+                stride <<= 1;
+
+                // Threads to run are halved
+                threadsToRun = paddedN >> (d + 1);
+                optimizedN = threadsToRun;
+
+                threadsToRun = (threadsToRun >= blockSize) ? blockSize : threadsToRun;
+                threadsToRun = (threadsToRun <= 32) ? 32 : threadsToRun;
+
+                optimizedBlockSize = threadsToRun;
+                optimizedBlocks = (optimizedN + optimizedBlockSize - 1) / optimizedBlockSize;
+            }
+
+#if ENABLE_DOWNSWEEP
+            for (int d = 0; d < stages; d++)
+            {
+                downsweep<<<optimizedBlocks, optimizedBlockSize>>>(paddedN, stride, dev_odata);
+                stride >>= 1;
+
+                // Since N is padded to the nearest power of 2, this logic to compute # of threads is fine
+                threadsToRun = 1u << (d + 1);
+                optimizedN = threadsToRun;
+
+                threadsToRun = (threadsToRun <= 32) ? 32 : threadsToRun;
+                threadsToRun = (threadsToRun >= blockSize) ? blockSize : threadsToRun;
+
+                optimizedBlockSize = threadsToRun;
+                optimizedBlocks = (optimizedN + optimizedBlockSize - 1) / optimizedBlockSize;
+            }
+#endif
+            timer().endGpuTimer();
+
+            cudaMemcpy(odata, dev_odata, sizeOfData, cudaMemcpyDeviceToHost);
+            
+            cudaFree(dev_odata);
+        }
+
+        void optimizedMemScan(int n, int *odata, const int *idata)
+        {
+            int paddedN = 1 << ilog2ceil(n);
+
+            int *dev_odata;
+
+            int sizeOfData = paddedN * sizeof(int);
+
+            cudaMalloc((void**)&dev_odata, sizeOfData);
+
+            // Copy idata to dev_odata first, this way we can easily modify in place
+            cudaMemcpy(dev_odata, idata, n * sizeof(int), cudaMemcpyHostToDevice);
+
+            int blockSize = 128;
+            int blocks = (paddedN + blockSize - 1) / blockSize;
+
+            timer().startGpuTimer();
+
+            // Ideally, we use one kernel per thread to reduce overhead from running MULTIPLE kernel dispatches.
+            // This also takes care of early terminating warps early on, as we don't run more than 1 dispatch.
+            optimizedSharedScan<<<blocks, blockSize>>>(paddedN, dev_odata);
+            
+            timer().endGpuTimer();
+
+            cudaMemcpy(odata, dev_odata, sizeOfData, cudaMemcpyDeviceToHost);
+            
+            cudaFree(dev_odata);
+        }
+
 
         /**
          * Performs stream compaction on idata, storing the result into odata.
@@ -141,7 +286,7 @@ namespace StreamCompaction {
          * @returns      The number of elements remaining after compaction.
          */
 
-        __global__ void assignBitmap(int n, int *dev_bitmap)
+        __global__ void kernMapToBoolean(int n, int *dev_bitmap)
         {
             int index = blockDim.x * blockIdx.x + threadIdx.x;
 
@@ -153,7 +298,7 @@ namespace StreamCompaction {
             dev_bitmap[index] = (dev_bitmap[index] > 0) ? 1 : 0;
         }
 
-        __global__ void scatter(int n, int *dev_bitmap, int *dev_odata, int *dev_idata)
+        __global__ void kernScatter(int n, int *dev_bitmap, int *dev_odata, int *dev_idata)
         {
             int index = blockDim.x * blockIdx.x + threadIdx.x;
 
@@ -195,7 +340,7 @@ namespace StreamCompaction {
             timer().startGpuTimer();
 
             // Write to dev_bitmap, input is idata memcpyed to dev_bitmap
-            assignBitmap<<<blocks, blockSize>>>(paddedN, dev_bitmap);
+            kernMapToBoolean<<<blocks, blockSize>>>(paddedN, dev_bitmap);
 
             // Copy dev_bitmap info to dev_odata, this is needed so we can run scan
             cudaMemcpy(dev_odata, dev_bitmap, sizeOfData, cudaMemcpyDeviceToDevice);
@@ -204,7 +349,7 @@ namespace StreamCompaction {
             scanDispatch(blocks, blockSize, paddedN, stages, stride, dev_odata);
 
             // Write to dev_odata with inputs idata, bitmap, and scanOutput, which is dev_odata at this point.
-            scatter<<<blocks, blockSize>>>(paddedN, dev_bitmap, dev_odata, dev_idata);
+            kernScatter<<<blocks, blockSize>>>(paddedN, dev_bitmap, dev_odata, dev_idata);
 
             timer().endGpuTimer();
 
