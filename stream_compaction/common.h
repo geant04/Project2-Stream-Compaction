@@ -13,7 +13,7 @@
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
 
-#define PROFILING_BLOCK_SIZE 512
+#define PROFILING_BLOCK_SIZE 128
 
 /**
  * Check for CUDA errors; print and exit if there was a problem.
