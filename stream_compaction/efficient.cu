@@ -164,7 +164,7 @@ namespace StreamCompaction {
             // Copy idata to dev_odata first, this way we can easily modify in place
             cudaMemcpy(dev_odata, idata, n * sizeof(int), cudaMemcpyHostToDevice);
 
-            int blockSize = 128;
+            int blockSize = PROFILING_BLOCK_SIZE;
             int blocks = (paddedN + blockSize - 1) / blockSize;
 
             int stages = ilog2(paddedN) - 1;
@@ -181,19 +181,10 @@ namespace StreamCompaction {
             cudaFree(dev_odata);
         }
 
-        void optimizedScan(int n, int *odata, const int *idata)
+
+        void optimizedScanDispatch(int paddedN, int* dev_odata)
         {
-            int paddedN = 1 << ilog2ceil(n);
-
-            int *dev_odata;
-            int sizeOfData = paddedN * sizeof(int);
-
-            cudaMalloc((void**)&dev_odata, sizeOfData);
-
-            // Copy idata to dev_odata first, this way we can easily modify in place
-            cudaMemcpy(dev_odata, idata, n * sizeof(int), cudaMemcpyHostToDevice);
-
-            int blockSize = 512;
+            int blockSize = PROFILING_BLOCK_SIZE;
             int blocks = (paddedN + blockSize - 1) / blockSize;
 
             int stages = ilog2(paddedN);
@@ -203,8 +194,6 @@ namespace StreamCompaction {
             int optimizedBlocks = blocks;
 
             int threadsToRun, optimizedN;
-
-            timer().startGpuTimer();
 
             for (int d = 0; d < stages; d++)
             {
@@ -239,6 +228,24 @@ namespace StreamCompaction {
                 optimizedBlocks = (optimizedN + optimizedBlockSize - 1) / optimizedBlockSize;
             }
 #endif
+        }
+
+        void optimizedScan(int n, int *odata, const int *idata)
+        {
+            int paddedN = 1 << ilog2ceil(n);
+
+            int *dev_odata;
+            int sizeOfData = paddedN * sizeof(int);
+
+            cudaMalloc((void**)&dev_odata, sizeOfData);
+
+            // Copy idata to dev_odata first, this way we can easily modify in place
+            cudaMemcpy(dev_odata, idata, n * sizeof(int), cudaMemcpyHostToDevice);
+
+            timer().startGpuTimer();
+
+            optimizedScanDispatch(paddedN, dev_odata);
+
             timer().endGpuTimer();
 
             cudaMemcpy(odata, dev_odata, sizeOfData, cudaMemcpyDeviceToHost);
@@ -246,8 +253,170 @@ namespace StreamCompaction {
             cudaFree(dev_odata);
         }
 
+        // ------------------------------------------------------------------------------------------
+        __global__ void optimizedUpDownsweep(int blockSize, int *dev_odata, int *dev_blockSums)
+        {
+            extern __shared__ float sharedData[];
+            
+            // local ID in the thread
+            int threadID = threadIdx.x;
+
+            sharedData[threadID] = dev_odata[blockDim.x * blockIdx.x + threadID];
+
+            __syncthreads();
+
+            // Shared mem upsweep
+            for (int d = blockSize >> 1; d > 0; d >>= 1)
+            {
+                if (threadID < d)
+                {
+                    int strideMult2 = blockSize / d;
+                    int stride = strideMult2 >> 1;
+
+                    int writeIndex = threadID * strideMult2;
+                    sharedData[writeIndex + strideMult2 - 1] += sharedData[writeIndex + stride - 1];
+                }
+
+                __syncthreads();
+            }
+
+            __syncthreads();
+
+            // Add the blockSum, and then clear the last element
+            int blockSum = sharedData[blockSize - 1];
+
+            if (threadID < 1)
+            {
+                dev_blockSums[blockIdx.x] = blockSum;
+                sharedData[blockSize - 1] = 0;
+            }
+
+            __syncthreads();
+
+            // Downsweep, result gives us an EXCLUSIVE SCAN.
+            for (int d = 1; d < blockSize; d <<= 1)
+            {
+                if (threadID < d)
+                {
+                    int stride = blockSize/d;
+                    int strideDiv2 = stride >> 1;
+
+                    int writeIndex = threadID * stride;
+
+                    int left = sharedData[writeIndex + strideDiv2 - 1];
+                    int right = sharedData[writeIndex + stride - 1];
+
+                    sharedData[writeIndex + strideDiv2 - 1] = right;
+                    sharedData[writeIndex + stride - 1] += left;
+                }
+
+                __syncthreads();
+            }
+
+            __syncthreads();
+
+            // By this point, we have an exclusive scan, but we need an inclusive scan for our overall scan to work.
+            // Then, we'll add back the blockSum and then life is good.
+
+            // For the given ID, we need to shift left to prepare for the inclusive scan.
+            // Last element will be 0 consequently, I think.
+
+            if (threadID == blockSize - 1)
+            {
+                dev_odata[blockDim.x * blockIdx.x + threadID] = blockSum;
+            }
+            else
+            {
+                dev_odata[blockDim.x * blockIdx.x + threadID] = sharedData[threadID + 1];
+            }
+        }
+
+        __global__ void addBlockSums(int *dev_blockSums, int *dev_odata)
+        {            
+            int index = blockDim.x * blockIdx.x + threadIdx.x;
+
+            int blockSum = dev_blockSums[blockIdx.x];
+
+            dev_odata[index] += blockSum;
+        }
+
+        __global__ void inclusiveToExclusive(int n, int *dev_odata, int *dev_idata)
+        {
+            int index = blockIdx.x * blockDim.x + threadIdx.x;
+            if (index >= n)
+            {
+                return;
+            }
+
+            if (index == 0)
+            {
+                dev_odata[index] = 0;
+                return;
+            }
+
+            dev_odata[index] = dev_idata[index - 1];
+        }
+
         void optimizedMemScan(int n, int *odata, const int *idata)
         {
+            int paddedN = 1 << ilog2ceil(n);
+
+            int *dev_odata2;
+            int *dev_odata;
+            int *dev_blockSums;
+
+            int sizeOfData = paddedN * sizeof(int);
+            cudaMalloc((void**)&dev_odata, sizeOfData);
+            cudaMalloc((void**)&dev_odata2, sizeOfData);
+
+            // Copy idata to dev_odata first, this way we can easily modify in place
+            cudaMemcpy(dev_odata, idata, n * sizeof(int), cudaMemcpyHostToDevice);
+
+            int blockSize = 128;
+            int blocks = (paddedN + blockSize - 1) / blockSize;
+
+            int finalBlockSize = 128;
+            int finalBlocks = (paddedN + finalBlockSize - 1) / finalBlockSize;
+
+            int paddedBlocks = 1 << ilog2ceil(blocks);
+            int blockSumByteSize = paddedBlocks * sizeof(int);
+
+            cudaMalloc((void**)&dev_blockSums, blockSumByteSize);
+            cudaMemset(dev_blockSums, 0, blockSumByteSize);
+
+            // insert gpu timer start
+            timer().startGpuTimer();
+
+            // step 1: upsweep sum accumulate on the input data
+            optimizedUpDownsweep<<<blocks, blockSize>>>(blockSize, dev_odata, dev_blockSums);
+
+            // step 2: perform exclusive scan on BLOCK sum
+            optimizedScanDispatch(paddedBlocks, dev_blockSums);
+
+            // step 3: add the blockSums back into the BLOCKS
+            addBlockSums<<<blocks, blockSize>>>(dev_blockSums, dev_odata);
+
+            // step 4: final dispatch to convert from inclusive to exclusive
+            inclusiveToExclusive<<<finalBlocks, finalBlockSize>>>(paddedN, dev_odata2, dev_odata);
+            
+            // insert gpu timer end
+            timer().endGpuTimer();
+
+            cudaMemcpy(odata, dev_odata2, sizeOfData, cudaMemcpyDeviceToHost);
+            
+            cudaFree(dev_odata2);
+            cudaFree(dev_odata);
+            cudaFree(dev_blockSums);
+        }
+
+        void optimizedMemScanOld(int n, int *odata, const int *idata)
+        {
+            // LOL!!!
+            if (n >= (1 << 8))
+            {
+                return;
+            }
+
             int paddedN = 1 << ilog2ceil(n);
 
             int *dev_odata;

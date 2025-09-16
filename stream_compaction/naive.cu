@@ -67,10 +67,10 @@ namespace StreamCompaction {
             cudaMemcpy(dev_idata, idata, dataSize, cudaMemcpyHostToDevice);
 
             // Kernel dispatches
-            int blockSize = n;
+            int blockSize = 128;
             int blocks = (paddedN + blockSize - 1) / blockSize;
 
-            int stages = ilog2ceil(n);
+            int stages = ilog2ceil(paddedN);
             int stride = 1;
 
             timer().startGpuTimer();
@@ -84,7 +84,6 @@ namespace StreamCompaction {
                 stride <<= 1;
             }
 
-            // Lord help me
             inclusiveToExclusive<<<blocks, blockSize>>>(paddedN, dev_odata, dev_idata);
 
             timer().endGpuTimer();
