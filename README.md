@@ -107,6 +107,7 @@ Depending on a block size, we can parallelize by having blocks work on chunks of
 
 
 ## Performance Analysis
+**For my performance analysis, I logged the measured time 50 times per algorithm and averaged the result to get my "average runtime" stat in ms.**
 
 ### Block Size Analysis + Dynamic Block Size Optimization
 #### Testing Block Sizes
