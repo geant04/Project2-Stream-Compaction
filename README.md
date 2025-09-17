@@ -98,7 +98,7 @@ Depending on a block size, we can parallelize by having blocks work on chunks of
  
  <table>
   <tr>
-    <td> <img src="img/divideToBlocks.png" width="500"></td>
+    <td> <img src="img/divideToblocks.png" width="500"></td>
     <td> <img src="img/sharedMemScan.png" width="500"></td>
   </tr> 
 </table>
