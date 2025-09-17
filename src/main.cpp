@@ -13,17 +13,17 @@
 #include <stream_compaction/thrust.h>
 #include "testing_helpers.hpp"
 
-const int SIZE = 1 << 12; // feel free to change the size of array
+const int SIZE = 1 << 14; // feel free to change the size of array
 const int NPOT = SIZE - 3; // Non-Power-Of-Two
 int *a = new int[SIZE];
 int *b = new int[SIZE];
 int *c = new int[SIZE];
 
 #define DISABLE_CPU 0
-#define ENABLE_NON_POWER_OF_TWO 0
+#define ENABLE_NON_POWER_OF_TWO 1
 #define USE_OPTIMIZED 1
 
-#define PROFILING 1
+#define PROFILING 0
 #define PROFILE_NON_POWER_OF_TWO 1
 
 void getAvgTest(int trials)
@@ -183,10 +183,6 @@ int main(int argc, char* argv[]) {
 #endif
 
 #if USE_OPTIMIZED
-
-    
-
-
     zeroArray(SIZE, c);
     printDesc("optimized work-efficient scan, power-of-two");
     StreamCompaction::Efficient::optimizedScan(SIZE, c, a);
@@ -265,7 +261,6 @@ int main(int argc, char* argv[]) {
     //printArray(count, c, true);
     printCmpLenResult(count, expectedCount, b, c);
 
-    /*
     zeroArray(SIZE, c);
     printDesc("work-efficient compact, power-of-two");
     count = StreamCompaction::Efficient::compact(SIZE, c, a);
@@ -278,7 +273,7 @@ int main(int argc, char* argv[]) {
     count = StreamCompaction::Efficient::compact(NPOT, c, a);
     printElapsedTime(StreamCompaction::Efficient::timer().getGpuElapsedTimeForPreviousOperation(), "(CUDA Measured)");
     //printArray(count, c, true);
-    printCmpLenResult(count, expectedNPOT, b, c);*/
+    printCmpLenResult(count, expectedNPOT, b, c);
 
 #endif // PROFILING
     system("pause"); // stop Win32 console from closing on exit

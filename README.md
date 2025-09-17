@@ -51,7 +51,9 @@ In terms of analyzing base performance, we take ```O(n)``` time with ```n-1``` a
 We can implement scan on the GPU using a series of passes that act on pairs of elements. For log(n) passes, we can modify our input array such that for an element j, and a given stride determined by stage number ```d``` from 0 to ```log(n)``` s.t ```strde = 2^(d-1)```, we let ```scan[j] = scan[j - stride] + scan[j]```.
 
 The algorithm can be visualized as such in log passes:
-![](img/naiveVisual.png)
+
+<img src="img/naiveVisual.png" width="500"></img>
+<br>
 *Image taken from GPU Gems 3, 39.2.1*
 
 Eventually, we reach our final array after all passes, and return such as the scan result.
@@ -64,13 +66,21 @@ We can further reduce the number of adds per stage using a balanced binary tree 
 
 The upsweep sums up pairs of left/right nodes to create parents s.t each parent node is a sum, where we will then repeat this paired sum in continual stages until we end up with one final sum, taking log(n) stages and dispatches. Note, however, that our adds is now ```O(n)```.
 
-![](img/upsweep.png)
+<table>
+  <tr>
+    <th>Upsweep</th>
+    <th>Downsweep</th>
+  </tr>
+  <tr>
+    <td> <img src="img/upsweep.png" width="500"></td>
+    <td> <img src="img/downsweep.png" width="500"></td>
+  </tr> 
+</table>
+<br>
+
 *Image taken from CIS 5650 slides*
 
 The downsweep uses the partial sums computed from the upsweep result (observe the non-yellow cells in the above image) to reconstruct and build our final scanned array. We first clear the last element and similarly work in pairs per stage, where for each pair, we sum the right node with its left and replace the left with right.
-
-![](img/downsweep.png)
-*Image taken from CIS 5650 slides*
 
 You can notice that our total adds is also ```O(n)``` in this downsweep stage, makign the overall adds ```O(2n) = O(n)```, with ```O(n)``` swaps as well. 
 
@@ -84,9 +94,15 @@ In implementation, it is often the case that work-efficient performs worse than 
 #### Shared Memory Optimized Work-Efficient GPU Scan (not working)
 Another limitation of all GPU implementations so far is the cost incurred from global memory reads and thus long scoreboard stalls.  We can avoid this issue by loading information into shared memory per SM and use a different approach that operates our scans on blocks, then merging results together.
 
-Depending on a block size, we can parallelize by having blocks work on chunks of our input array ```n```. Per block, we can populate the array into its shared memory and then perform an inclusive sweep, while also writing overall sums into an array of block sums. We can perform an additional scan on the block sum array before (thinking of this as all sums of element before the given block), then adding the scanned block sum results back into the respective blocks, giving us an optimized scan. 
-![](img/divideToblocks.png)
-![](img/sharedMemScan.png)
+Depending on a block size, we can parallelize by having blocks work on chunks of our input array ```n```. Per block, we can populate the array into its shared memory and then perform an inclusive sweep, while also writing overall sums into an array of block sums. We can perform an additional scan on the block sum array before (thinking of this as all sums of element before the given block), then adding the scanned block sum results back into the respective blocks, giving us an optimized scan.
+ 
+ <table>
+  <tr>
+    <td> <img src="img/divideToBlocks.png" width="500"></td>
+    <td> <img src="img/sharedMemScan.png" width="500"></td>
+  </tr> 
+</table>
+
 *Images taken from CIS 5650 slides*
 
 
@@ -228,9 +244,150 @@ In this case, for N=2^12 (4096) **we went from 0.422ms to 0.244ms.** However I w
 
 ---
 #### Thrust Analysis
+In all tests, thrust always outpeformed the rest of the implementations. There's not too much information to go off of for why thrust is better computationally besides the observation that it runs off of three kernels, a constant number of times, compared to the others. This probably means, then, that thrust heavily uses shared memory to run multiple stages within the kernel instead of multiple dispatches.
 
+Using NSight Compute, I analyzed the most expensive kernel, DeviceScanKernel, with a duration of 4.22us with 1.07 compute throughput and 3.34 memory throughput. 
 
+Digging around the kernel code, I was able to find a mention of ```AgentScan```, which does use shared memory per tile.
+
+```
+  // Shared memory for AgentScan
+  __shared__ typename AgentScanT::TempStorage temp_storage;
+
+  RealInitValueT real_init_value = init_value;
+
+  // Process tiles
+  AgentScanT(temp_storage, d_in, d_out, scan_op, real_init_value).ConsumeRange(num_items, tile_state, start_tile);
+```
+Thrust also probably some special indexing of memory(?), as there are mentions of loading 1D data in a **"warp-striped"** order. Looking it up online, CUDA's CUB library discusses [warp-striped](https://nvidia.github.io/cccl/cub/index.html#flexible-data-arrangement) as part of a possible speedup from processing more than one datum per thread". 
+
+The striped arrangement, then, essentially has the items owned by a thread have a stride in-between, possibly for better coalesced access to global memory. Info about coalesced access can be found [at this link](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory) (this is actually a good time for me to read up on this too, since I was a bit lost in lecture).
+
+![](img/stripedArrangement.png)
+<br>
+*Striped arrangement diagram, emphasis on thread_0. From the CUDA Core Compute Libraries*
+
+I have no idea how thrust loads and uses warp-striped arrangement for its data, but at the end of the day, less kernels are used and there's a high chance of coalesced memory access and shared memory use that allow for better performance overall.
 
 ---
 ### Test Program Output
-Erm...
+
+Tested output for 2^20. **Ignore the ```SHARED MEMORY scan``` since it only works for values of < 2^14.**
+```
+****************
+** SCAN TESTS **
+****************
+==== cpu scan, power-of-two ====
+   elapsed time: 5.4788ms    (std::chrono Measured)
+    [   0   0   1   3   6  10  15  21  28  36  45  55  66 ... -2621437 -1572863 ]
+==== cpu scan, non-power-of-two ====
+   elapsed time: 2.1245ms    (std::chrono Measured)
+    passed
+==== naive scan, power-of-two ====
+   elapsed time: 1.85395ms    (CUDA Measured)
+    passed
+==== naive scan, non-power-of-two ====
+   elapsed time: 0.761792ms    (CUDA Measured)
+    passed
+==== work-efficient scan, power-of-two ====
+   elapsed time: 1.65174ms    (CUDA Measured)
+    passed
+==== work-efficient scan, non-power-of-two ====
+   elapsed time: 1.35082ms    (CUDA Measured)
+    passed
+==== optimized work-efficient scan, power-of-two ====
+   elapsed time: 0.858496ms    (CUDA Measured)
+    passed
+==== optimized work-efficient SHARED MEMORY scan, power-of-two ====
+   elapsed time: 1.48685ms    (CUDA Measured)
+    a[256] = 32640, b[256] = 8128
+    FAIL VALUE
+==== optimized work-efficient scan, non-power-of-two ====
+   elapsed time: 0.678656ms    (CUDA Measured)
+    passed
+==== thrust scan, power-of-two ====
+   elapsed time: 1.33632ms    (CUDA Measured)
+    passed
+==== thrust scan, non-power-of-two ====
+   elapsed time: 0.569504ms    (CUDA Measured)
+    passed
+
+*****************************
+** STREAM COMPACTION TESTS **
+*****************************
+==== cpu compact without scan, power-of-two ====
+   elapsed time: 0.8987ms    (std::chrono Measured)
+    passed
+==== cpu compact without scan, non-power-of-two ====
+   elapsed time: 1.1818ms    (std::chrono Measured)
+    passed
+==== cpu compact with scan ====
+   elapsed time: 11.212ms    (std::chrono Measured)
+    passed
+==== work-efficient compact, power-of-two ====
+   elapsed time: 1.53654ms    (CUDA Measured)
+    passed
+==== work-efficient compact, non-power-of-two ====
+   elapsed time: 1.40259ms    (CUDA Measured)
+    passed
+```
+---
+For fun, here's the result for 2^12 with the shared memory working, scoring better than my optimized work-efficient by about **~0.162ms.**
+
+```
+****************
+** SCAN TESTS **
+****************
+==== cpu scan, power-of-two ====
+   elapsed time: 0.0112ms    (std::chrono Measured)
+    [   0   0   1   3   6  10  15  21  28  36  45  55  66 ... 8378371 8382465 ]
+==== cpu scan, non-power-of-two ====
+   elapsed time: 0.012ms    (std::chrono Measured)
+    passed
+==== naive scan, power-of-two ====
+   elapsed time: 0.57856ms    (CUDA Measured)
+    passed
+==== naive scan, non-power-of-two ====
+   elapsed time: 0.30416ms    (CUDA Measured)
+    passed
+==== work-efficient scan, power-of-two ====
+   elapsed time: 0.995328ms    (CUDA Measured)
+    passed
+==== work-efficient scan, non-power-of-two ====
+   elapsed time: 0.572416ms    (CUDA Measured)
+    passed
+==== optimized work-efficient scan, power-of-two ====
+   elapsed time: 0.43008ms    (CUDA Measured)
+    passed
+==== optimized work-efficient SHARED MEMORY scan, power-of-two ====
+   elapsed time: 0.268288ms    (CUDA Measured)
+    passed
+==== optimized work-efficient scan, non-power-of-two ====
+   elapsed time: 0.428032ms    (CUDA Measured)
+    passed
+==== thrust scan, power-of-two ====
+   elapsed time: 0.403456ms    (CUDA Measured)
+    passed
+==== thrust scan, non-power-of-two ====
+   elapsed time: 0.126976ms    (CUDA Measured)
+    passed
+
+*****************************
+** STREAM COMPACTION TESTS **
+*****************************
+==== cpu compact without scan, power-of-two ====
+   elapsed time: 0.0021ms    (std::chrono Measured)
+    passed
+==== cpu compact without scan, non-power-of-two ====
+   elapsed time: 0.002ms    (std::chrono Measured)
+    passed
+==== cpu compact with scan ====
+   elapsed time: 0.0176ms    (std::chrono Measured)
+    passed
+==== work-efficient compact, power-of-two ====
+   elapsed time: 0.35328ms    (CUDA Measured)
+    passed
+==== work-efficient compact, non-power-of-two ====
+   elapsed time: 0.592896ms    (CUDA Measured)
+    passed
+```
